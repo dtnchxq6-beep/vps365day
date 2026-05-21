@@ -1,0 +1,332 @@
+name: AI STV PREMIUM RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Thời gian sử dụng"
+        required: true
+        default: "90day"
+        type: choice
+        options:
+          - "1h"
+          - "3h"
+          - "24h"
+          - "90day"
+
+jobs:
+  Premium-RDP-Setup:
+    runs-on: windows-latest
+
+    # 90 ngày = 129600 phút
+    timeout-minutes: 129600
+
+    steps:
+
+      # =========================
+      # START
+      # =========================
+      - name: START SYSTEM
+        shell: powershell
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          chcp 65001 > $null
+
+          Write-Host ""
+          Write-Host "====================================" -ForegroundColor Cyan
+          Write-Host "AI STV PREMIUM RDP SERVER" -ForegroundColor Yellow
+          Write-Host ("Duration: " + "${{ github.event.inputs.duration }}") -ForegroundColor Green
+          Write-Host "====================================" -ForegroundColor Cyan
+          Write-Host ""
+
+      # =========================
+      # ENABLE RDP
+      # =========================
+      - name: ENABLE RDP
+        shell: powershell
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          try {
+
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                -Name "fDenyTSConnections" `
+                -Value 0
+
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                -Name "UserAuthentication" `
+                -Value 0
+
+              netsh advfirewall firewall add rule `
+                name="RDP" `
+                dir=in `
+                action=allow `
+                protocol=TCP `
+                localport=3389
+
+              Set-Service `
+                -Name TermService `
+                -StartupType Automatic
+
+              Start-Service `
+                -Name TermService
+
+              Write-Host "RDP Enabled Successfully" -ForegroundColor Green
+
+          } catch {
+
+              Write-Host "RDP Setup Failed" -ForegroundColor Red
+              exit 1
+          }
+
+      # =========================
+      # CREATE USER
+      # =========================
+      - name: CREATE USER
+        shell: powershell
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          function New-RandomPassword {
+
+              $chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+
+              $pw = ""
+
+              for ($i = 0; $i -lt 8; $i++) {
+
+                  $pw += $chars[(Get-Random -Minimum 0 -Maximum $chars.Length)]
+              }
+
+              return $pw
+          }
+
+          $password = New-RandomPassword
+
+          $secure = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          try {
+
+              Remove-LocalUser `
+                -Name "AISTV-PREMIUM" `
+                -ErrorAction SilentlyContinue
+
+          } catch {}
+
+          try {
+
+              New-LocalUser `
+                -Name "AISTV-PREMIUM" `
+                -Password $secure `
+                -AccountNeverExpires
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member "AISTV-PREMIUM"
+
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member "AISTV-PREMIUM"
+
+              echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+              Write-Host "User Created Successfully" -ForegroundColor Green
+
+          } catch {
+
+              Write-Host "User Creation Failed" -ForegroundColor Red
+              exit 1
+          }
+
+      # =========================
+      # INSTALL TAILSCALE
+      # =========================
+      - name: INSTALL TAILSCALE
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          Write-Host "Installing Tailscale..." -ForegroundColor Yellow
+
+          $msi = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" `
+            -Wait
+
+          Start-Sleep -Seconds 15
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $ts)) {
+
+              Write-Host "tailscale.exe not found" -ForegroundColor Red
+              exit 1
+          }
+
+          Write-Host "Connecting Tailscale..." -ForegroundColor Cyan
+
+          & $ts up `
+            --authkey=$env:TAILSCALE_AUTH_KEY `
+            --hostname="ai-stv-${{ github.run_id }}" `
+            --accept-routes `
+            --accept-dns `
+            --reset
+
+          if ($LASTEXITCODE -ne 0) {
+
+              Write-Host "Tailscale Login Failed" -ForegroundColor Red
+              exit 1
+          }
+
+          Start-Sleep -Seconds 10
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 10; $i++) {
+
+              try {
+
+                  $ip = & $ts ip -4
+
+                  if ($ip) {
+
+                      break
+                  }
+
+              } catch {}
+
+              Start-Sleep -Seconds 3
+          }
+
+          if (!$ip) {
+
+              Write-Host "Cannot Get Tailscale IP" -ForegroundColor Red
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host ("Connected Successfully - IP: " + $ip) -ForegroundColor Green
+
+      # =========================
+      # SHOW INFO
+      # =========================
+      - name: SHOW RDP INFO
+        shell: powershell
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          $durationInput = "${{ github.event.inputs.duration }}"
+
+          switch ($durationInput) {
+
+              "1h" {
+
+                  $totalMinutes = 60
+                  $displayTime = "1 Hour"
+              }
+
+              "3h" {
+
+                  $totalMinutes = 180
+                  $displayTime = "3 Hours"
+              }
+
+              "24h" {
+
+                  $totalMinutes = 1440
+                  $displayTime = "24 Hours"
+              }
+
+              "90day" {
+
+                  $totalMinutes = 129600
+                  $displayTime = "90 Days"
+              }
+
+              default {
+
+                  $totalMinutes = 1440
+                  $displayTime = "24 Hours"
+              }
+          }
+
+          echo "TOTAL_MINUTES=$totalMinutes" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "====================================" -ForegroundColor Cyan
+          Write-Host "RDP INFORMATION" -ForegroundColor Yellow
+          Write-Host "====================================" -ForegroundColor Cyan
+
+          Write-Host ("IP: " + $env:TAILSCALE_IP)
+          Write-Host "USER: AISTV-PREMIUM"
+          Write-Host ("PASS: " + $env:RDP_PASS)
+          Write-Host "PORT: 3389"
+          Write-Host ("TIME: " + $displayTime)
+
+          Write-Host "====================================" -ForegroundColor Cyan
+
+      # =========================
+      # KEEP RUNNING
+      # =========================
+      - name: KEEP SERVER RUNNING
+        shell: powershell
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          $minutes = [int]$env:TOTAL_MINUTES
+
+          for ($i = 0; $i -lt $minutes; $i++) {
+
+              $remaining = $minutes - $i
+
+              Write-Host ("Server Running - Remaining " + $remaining + " minutes")
+
+              Start-Sleep -Seconds 60
+          }
+
+      # =========================
+      # CLEANUP
+      # =========================
+      - name: CLEANUP
+        if: always()
+        shell: powershell
+        run: |
+
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          try {
+
+              Disable-LocalUser `
+                -Name "AISTV-PREMIUM" `
+                -ErrorAction SilentlyContinue
+
+          } catch {}
+
+          try {
+
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" down
+
+          } catch {}
+
+          Write-Host "Cleanup Completed" -ForegroundColor Green
